@@ -1,5 +1,5 @@
 /*
- * "Thermor" DG950R Weather Station receiver v 0.2
+ * "Thermor" DG950R Weather Station receiver v 0.3
  *
  * Receives data from "Thermor" DG950R Weather Station receiver, via
  * a 433Mhz RF receiver connected to pin 8 of the arduino, and outputs
@@ -11,7 +11,6 @@
  * http://kayno.net/2010/01/15/arduino-weather-station-receiver-shield/
  *
  * TODO:
- * - determine if there is a checksum byte/bits, or if the sending of the data 4 times is itself a checksum
  * - handle rain packets better - bucket tips are are sent incrementally - rain mm is calculated by subtracting
  *   current tip count from previous. should report tip count rather than doing calulation on arduino so that
  *   if the arduino is reset or a packet sent from it is missed, any missed rain value can still be calculated
@@ -75,7 +74,6 @@
 #define RAIN_TIP_COUNT_OVERFLOW     3
 #define RAIN_MM_PER_TIP             0.5
 
-
 //#define DEBUG
 
 // Type aliases for brevity in the actual code
@@ -93,8 +91,12 @@ uint weather_rx_state;
 
 boolean previous_period_was_short = false;
 
-//byte array used to store incoming weather data
+// byte arrays used to store incoming weather data
 byte weather_packet[(WEATHER_PACKET_BIT_LENGTH/8)];
+byte last_weather_packet[(WEATHER_PACKET_BIT_LENGTH/8)];
+
+// packet counter - 4 identical packets in a row means the packet is valid
+int packet_count = 0;
 
 const char wind_directions[16][4] = 
 {
@@ -213,7 +215,7 @@ void setup() {
   
   WEATHER_RESET();
   
-  Serial.println("\"Thermor\" DG950R Weather Station receiver v0.2");
+  Serial.println("\"Thermor\" DG950R Weather Station receiver v0.3");
   Serial.println("Ready to receive weather data");
 }
 
@@ -249,114 +251,147 @@ void setup() {
  * wd = wind direction
  * r = rain 
  */
+
 void loop() {
-  uint station_id;
-  uint packet_type;
   
   // weather packet ready to decode
   if(weather_rx_state == RX_STATE_PACKET_RECEIVED) {
-    // get station if and packet type
-    station_id = weather_packet[WEATHER_STATION_ID];
-    packet_type = weather_packet[WEATHER_PACKET_TYPE] & 0x0F; //last 4 bits of the byte
   
 #ifdef DEBUG
-    Serial.println();
+      Serial.println();
     
-    for(int i = 0; i < ((WEATHER_PACKET_BIT_LENGTH/8)); i++) {
-      Serial.print(weather_packet[i], BIN);
-      Serial.print(" ");
-    }
+      for(int i = 0; i < ((WEATHER_PACKET_BIT_LENGTH/8)); i++) {
+        Serial.print(weather_packet[i], BIN);
+        Serial.print(" ");
+      }
     
-    Serial.println();
+      Serial.println();
 #endif
     
-    // decode the packet, based on the packet type
-    switch(packet_type) {
-      case PACKET_TYPE_SYNC:
-        // sync packet, just report it.
-        Serial.print("SYNC,");
-        Serial.print(station_id, DEC);
-        break;
-        
-      case PACKET_TYPE_WIND:
-        // wind packet
-        // check first to make sure the wind anemometer and vane is connected
-        // if it is not connected, B11111111 and B11111111 is transmitted
-        if(weather_packet[WIND_SPEED] != B11111111 && weather_packet[WIND_SPEED_OVERFLOW] != B11111111) {
-          Serial.print("WIND,");
-          Serial.print(station_id, DEC);
-          Serial.print(",");
-          
-          // wind direction
-          Serial.print(wind_directions[weather_packet[WIND_DIRECTION]]);
-          Serial.print(",");
+    // if this packet is the same as the last 3, its valid
+    if((compare_packets(weather_packet, last_weather_packet)) && packet_count == 3) {
+      uint station_id;
+      uint packet_type;
+  
+      // get station if and packet type
+      station_id = weather_packet[WEATHER_STATION_ID];
+      packet_type = weather_packet[WEATHER_PACKET_TYPE] & 0x0F; //last 4 bits of the byte
     
-          // wind speed
-          Serial.print((weather_packet[WIND_SPEED]+(weather_packet[WIND_SPEED_OVERFLOW]*256))*WIND_SPEED_FACTOR);
-          break;
-        }
-        
-      case PACKET_TYPE_TEMP:
-        // outside temp packet
-        // if the the data is B11111111 and B11111111, ignore (happens when wind anemometer and vane is first connected)
-        if(weather_packet[TEMP_WHOLE] != B11111111 && weather_packet[TEMP_DECIMAL] != B11111111) {
-          Serial.print("TEMP,");
+      // decode the packet, based on the packet type
+      switch(packet_type) {
+        case PACKET_TYPE_SYNC:
+          // sync packet, just report it.
+          Serial.print("SYNC,");
           Serial.print(station_id, DEC);
-          Serial.print(",");
-          
-          // print the whole number value of the temperature
-          // temp offset (-41) allows -40 degrees to reported as 1 (a positive number, negating need to deal with negatives)
-          Serial.print((weather_packet[TEMP_WHOLE]-TEMP_OFFSET), DEC); //temp before decimal point. 
-          Serial.print("."); //decimal point
-          
-          //print the decimal value of the temperature
-          Serial.print(weather_packet[TEMP_DECIMAL], DEC);
           break;
-        }
-        
-      case PACKET_TYPE_RAIN:
-        // rain packet
-        // if the the data is B11111111 and B11111111, ignore (happens when wind anemometer and vane is first connected)
-        if(weather_packet[TEMP_WHOLE] != B11111111 && weather_packet[TEMP_DECIMAL] != B11111111) {
-        
-          // calculate rain tips
-          if(previous_rain_tip_count == 0) {
-            current_rain_tip_count = 0;
-          } else {
-            current_rain_tip_count = weather_packet[RAIN_TIP_COUNT]+(weather_packet[RAIN_TIP_COUNT_OVERFLOW]*256) - previous_rain_tip_count;
+          
+        case PACKET_TYPE_WIND:
+          // wind packet
+          // check first to make sure the wind anemometer and vane is connected
+          // if it is not connected, B11111111 and B11111111 is transmitted
+          if(weather_packet[WIND_SPEED] != B11111111 && weather_packet[WIND_SPEED_OVERFLOW] != B11111111) {
+            Serial.print("WIND,");
+            Serial.print(station_id, DEC);
+            Serial.print(",");
+            
+            // wind direction
+            Serial.print(wind_directions[weather_packet[WIND_DIRECTION]]);
+            Serial.print(",");
+      
+            // wind speed
+            Serial.print((weather_packet[WIND_SPEED]+(weather_packet[WIND_SPEED_OVERFLOW]*256))*WIND_SPEED_FACTOR);
+            break;
           }
           
-          // store this so we can calculate number of tips next time round
-          previous_rain_tip_count = weather_packet[RAIN_TIP_COUNT]+(weather_packet[RAIN_TIP_COUNT_OVERFLOW]*256);
+        case PACKET_TYPE_TEMP:
+          // outside temp packet
+          // if the the data is B11111111 and B11111111, ignore (happens when wind anemometer and vane is first connected)
+          if(weather_packet[TEMP_WHOLE] != B11111111 && weather_packet[TEMP_DECIMAL] != B11111111) {
+            Serial.print("TEMP,");
+            Serial.print(station_id, DEC);
+            Serial.print(",");
+            
+            // print the whole number value of the temperature
+            // temp offset (-41) allows -40 degrees to reported as 1 (a positive number, negating need to deal with negatives)
+            Serial.print((weather_packet[TEMP_WHOLE]-TEMP_OFFSET), DEC); //temp before decimal point. 
+            Serial.print("."); //decimal point
+            
+            //print the decimal value of the temperature
+            Serial.print(weather_packet[TEMP_DECIMAL], DEC);
+            break;
+          }
           
-          // print the rain fall, in mm
-          Serial.print("RAIN,");
+        case PACKET_TYPE_RAIN:
+          // rain packet
+          // if the the data is B11111111 and B11111111, ignore (happens when wind anemometer and vane is first connected)
+          if(weather_packet[TEMP_WHOLE] != B11111111 && weather_packet[TEMP_DECIMAL] != B11111111) {
+          
+            // calculate rain tips
+            if(previous_rain_tip_count == 0) {
+              current_rain_tip_count = 0;
+            } else {
+              current_rain_tip_count = weather_packet[RAIN_TIP_COUNT]+(weather_packet[RAIN_TIP_COUNT_OVERFLOW]*256) - previous_rain_tip_count;
+            }
+            
+            // store this so we can calculate number of tips next time round
+            previous_rain_tip_count = weather_packet[RAIN_TIP_COUNT]+(weather_packet[RAIN_TIP_COUNT_OVERFLOW]*256);
+            
+            // print the rain fall, in mm
+            Serial.print("RAIN,");
+            Serial.print(station_id, DEC);
+            Serial.print(",");
+            Serial.print(current_rain_tip_count*RAIN_MM_PER_TIP);
+            break;
+          }
+          
+        default:
+          // unknown packet, output the packet for further investigation
+          Serial.print("UNKNOWN,");
           Serial.print(station_id, DEC);
           Serial.print(",");
-          Serial.print(current_rain_tip_count*RAIN_MM_PER_TIP);
+      
+          // print out the bytes for debug purposes
+          for(int i = 0; i < ((WEATHER_PACKET_BIT_LENGTH/8)); i++) {
+            Serial.print(weather_packet[i], BIN);
+            Serial.print(" ");
+          }
+          
           break;
-        }
-        
-      default:
-        // unknown packet, output the packet for further investigation
-        Serial.print("UNKNOWN,");
-        Serial.print(station_id, DEC);
-        Serial.print(",");
+          
+      }
+      
+      // reset the packet counter, ready for next lot of packets
+      packet_count = 0;
+      
+      Serial.println();
     
-        // print out the bytes for debug purposes
-        for(int i = 0; i < ((WEATHER_PACKET_BIT_LENGTH/8)); i++) {
-          Serial.print(weather_packet[i], BIN);
-          Serial.print(" ");
-        }
-        
-        break;
-        
+    } else if ((compare_packets(weather_packet, last_weather_packet)) || packet_count == 0) {
+      // packet same as last, or first packet received - increment counter
+      packet_count++;
+    } else {
+      // packet different to last packet - reset counter
+      packet_count = 0;
+    }
+
+    // remember the last packet received for comparison next time around
+    for(int i = 0; i < ((WEATHER_PACKET_BIT_LENGTH/8)); i++) {
+      last_weather_packet[i] = weather_packet[i];
     }
     
-    Serial.println();
-    
     WEATHER_RESET();
+
   }
 } 
+
+// return false if packets are different, else true
+int compare_packets(byte *packet_a, byte *packet_b) {
+  // loop over each byte, but only the first 7 - the last is often incomplete and not part of the data
+  for(int i = 0; i < (((WEATHER_PACKET_BIT_LENGTH-8)/8)); i++) {
+    if(packet_a[i] != packet_b[i]) {
+      return false;
+    }
+  }
+  return true;
+}
 
 
